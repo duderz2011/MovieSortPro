@@ -16,12 +16,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import date
 from difflib import SequenceMatcher
 from pathlib import Path
 from tkinter import Tk, Toplevel, StringVar, BooleanVar, Listbox, END, filedialog, messagebox, simpledialog
 from tkinter import ttk
 from typing import Optional
 from metadata_sources import PROVIDERS, MetadataResolver
+from movie_collections import collect, movie_order, key_name
 from preferences import read_preferences, write_preferences, seal, unseal
 
 APP_NAME = "MovieSort Pro"
@@ -132,7 +134,11 @@ class TMDb:
         cached = self.conn.execute("SELECT value FROM movies WHERE lookup_key=?", (key,)).fetchone()
         if cached:
             saved = json.loads(cached[0])
-            return saved["metadata"], saved["state"]
+            prior = saved.get("metadata") or {}
+            # V2.1 caches store collection names without TMDB collection IDs.
+            # Refresh that entry on demand so V3 can detect absent sequels.
+            if not (prior.get("collection") and not prior.get("collection_id") and prior.get("tmdb_id")):
+                return prior, saved["state"]
         params = {"query": title, "include_adult": "false", "language": "en-GB"}
         if year:
             params["year"] = year
@@ -166,6 +172,7 @@ class TMDb:
             "directors": list(dict.fromkeys(x["name"] for x in crew if x.get("job") == "Director")),
             "countries": [x.get("name") for x in (details.get("production_countries") or []) if x.get("name")],
             "collection": (details.get("belongs_to_collection") or {}).get("name"),
+            "collection_id": (details.get("belongs_to_collection") or {}).get("id"),
             "plot": details.get("overview"),
             "imdb_id": details.get("imdb_id"),
             "tmdb_id": details["id"],
@@ -174,6 +181,29 @@ class TMDb:
         self.conn.commit()
         time.sleep(0.20)
         return meta, "Matched"
+
+    def collection_parts(self, collection_id: str) -> list[dict]:
+        """Load full TMDB collection inventory with a 30-day local cache."""
+        if not str(collection_id).isdigit():
+            raise ValueError("Invalid TMDB collection ID")
+        key = f"collection-v3:{collection_id}"
+        self.conn.execute("CREATE TABLE IF NOT EXISTS collections (lookup_key TEXT PRIMARY KEY, value TEXT, stored_at REAL)")
+        found = self.conn.execute("SELECT value, stored_at FROM collections WHERE lookup_key=?", (key,)).fetchone()
+        if found and time.time() - found[1] < 30 * 86400:
+            return json.loads(found[0])
+        try:
+            details = self.get(f"collection/{collection_id}", {"language": "en-GB"})
+            parts = details.get("parts")
+            if not isinstance(parts, list):
+                raise ValueError("TMDB did not return a collection catalogue")
+            self.conn.execute("INSERT OR REPLACE INTO collections VALUES (?, ?, ?)",
+                              (key, json.dumps(parts), time.time()))
+            self.conn.commit()
+            return parts
+        except (ValueError, RuntimeError):
+            if found:
+                return json.loads(found[0])
+            raise
 
     def close(self):
         self.conn.close()
@@ -293,7 +323,7 @@ def choose_target(source: Path, desired: Path, reserved: set[str]) -> tuple[Opti
 class App(Tk):
     def __init__(self):
         super().__init__()
-        self.title(APP_NAME + " V2.1 — Movie Library Organiser")
+        self.title(APP_NAME + " V3 — Movie Library & Collections")
         self.geometry("1220x790")
         self.minsize(950, 650)
         self.configure(bg="#151a24")
@@ -313,6 +343,8 @@ class App(Tk):
         style.configure("TProgressbar", thickness=12)
         self.sources: list[Path] = []
         self.movies: list[Movie] = []
+        self.collection_groups = []
+        self.collection_membership = {}
         self.events = queue.Queue()
         self.busy = False
         self.destination = StringVar()
@@ -329,6 +361,9 @@ class App(Tk):
         self.rename = BooleanVar(value=True)
         self.movie_folder = BooleanVar(value=False)
         self.include_sidecars = BooleanVar(value=True)
+        self.auto_collections = BooleanVar(value=True)
+        self.collection_minimum = StringVar(value="2")
+        self.check_missing = BooleanVar(value=True)
         self.status = StringVar(value="Add one or more source folders and an output folder to begin.")
         self.restore_preferences()
         self._draw()
@@ -350,9 +385,12 @@ class App(Tk):
         if saved.get("mode") in ("Copy", "Move"):
             self.mode.set(saved["mode"])
         for name, var in (("rename", self.rename), ("movie_folder", self.movie_folder),
-                          ("include_sidecars", self.include_sidecars), ("merge_metadata", self.merge_metadata)):
+                          ("include_sidecars", self.include_sidecars), ("merge_metadata", self.merge_metadata),
+                          ("auto_collections", self.auto_collections), ("check_missing", self.check_missing)):
             if isinstance(saved.get(name), bool):
                 var.set(saved[name])
+        if str(saved.get("collection_minimum", "2")) in ("2", "3", "4"):
+            self.collection_minimum.set(str(saved.get("collection_minimum", "2")))
         if isinstance(saved.get("levels"), list):
             for var, level in zip(self.levels, saved["levels"]):
                 if level in CUSTOM_LEVELS:
@@ -377,6 +415,9 @@ class App(Tk):
             "selected_actor": self.selected_actor.get(), "mode": self.mode.get(),
             "rename": self.rename.get(), "movie_folder": self.movie_folder.get(),
             "include_sidecars": self.include_sidecars.get(),
+            "auto_collections": self.auto_collections.get(),
+            "collection_minimum": self.collection_minimum.get(),
+            "check_missing": self.check_missing.get(),
             "source_priority": list(self.source_priority),
             "source_enabled": {k: var.get() for k, var in self.source_enabled.items()},
             "merge_metadata": self.merge_metadata.get(),
@@ -399,7 +440,7 @@ class App(Tk):
         """Display metadata provider credits without exposing user API credentials."""
         messagebox.showinfo(
             "About MovieSort Pro / Credits",
-            "MovieSort Pro V2.1\nFree and open-source movie organiser (MIT).\n\n"
+            "MovieSort Pro V3\nFree and open-source movie organiser (MIT).\n\n"
             "This product uses the TMDB API but is not endorsed or certified by TMDB.\n"
             "TMDB: https://www.themoviedb.org\n\n"
             "Other optional sources: OMDb (https://www.omdbapi.com), "
@@ -487,12 +528,26 @@ class App(Tk):
         row2.pack(fill="x", pady=(8, 0))
         ttk.Checkbutton(row2, text="Extra movie folder (ignored if Movie Title is a level)", variable=self.movie_folder, command=self.refresh_preview).pack(side="left")
         ttk.Checkbutton(row2, text="Bring matching subtitles and artwork", variable=self.include_sidecars).pack(side="left", padx=(19, 0))
+        collection_row = ttk.Frame(settings)
+        collection_row.pack(fill="x", pady=(8, 0))
+        ttk.Checkbutton(collection_row, text="Automatically organise movie collections", variable=self.auto_collections,
+                        command=self.refresh_preview).pack(side="left")
+        ttk.Label(collection_row, text="Minimum owned titles:").pack(side="left", padx=(15, 5))
+        minimum = ttk.Combobox(collection_row, textvariable=self.collection_minimum, values=["2", "3", "4"],
+                               width=3, state="readonly")
+        minimum.pack(side="left")
+        minimum.bind("<<ComboboxSelected>>", lambda _: self.status.set("Collection minimum changed. Scan again to apply the new threshold."))
+        ttk.Checkbutton(collection_row, text="Check for missing sequels (TMDB)",
+                        variable=self.check_missing).pack(side="left", padx=(17, 0))
         action = ttk.Frame(self, padding=(20, 7, 20, 5))
         action.pack(fill="x")
         self.scan_btn = ttk.Button(action, text="1  SCAN & IDENTIFY", command=self.scan)
         self.scan_btn.pack(side="left")
         self.go_btn = ttk.Button(action, text="2  ORGANISE MOVIES", command=self.organise, state="disabled")
         self.go_btn.pack(side="left", padx=8)
+        self.collections_btn = ttk.Button(action, text="Collections / Missing Movies", command=self.show_collections,
+                                          state="disabled")
+        self.collections_btn.pack(side="left", padx=5)
         ttk.Button(action, text="Correct Selected Match", command=self.correct_selected).pack(side="left", padx=(6, 8))
         ttk.Button(action, text="Undo Last Move", command=self.undo_last_move).pack(side="right")
         ttk.Button(action, text="Open Last Report", command=self.open_last_report).pack(side="right", padx=8)
@@ -642,6 +697,9 @@ class App(Tk):
         # at their target path are skipped rather than renamed to [2] copies.
         self.save_preferences()
         self.movies = []
+        self.collection_groups = []
+        self.collection_membership = {}
+        self.collections_btn.configure(state="disabled")
         for item in self.tree.get_children():
             self.tree.delete(item)
         self.progress.configure(value=0)
@@ -649,9 +707,11 @@ class App(Tk):
         configuration = dict(priority=list(self.source_priority), enabled={k: v.get() for k, v in self.source_enabled.items()},
                              tmdb_token=self.token.get(), omdb_key=self.omdb_key.get(),
                              catalogue_path=self.catalogue_path.get(), merge=self.merge_metadata.get())
-        threading.Thread(target=self.scan_thread, args=(dest, configuration), daemon=True).start()
+        collection_options = (self.auto_collections.get(), int(self.collection_minimum.get()),
+                              self.check_missing.get())
+        threading.Thread(target=self.scan_thread, args=(dest, configuration, collection_options), daemon=True).start()
 
-    def scan_thread(self, destination: Path, configuration: dict):
+    def scan_thread(self, destination: Path, configuration: dict, collection_options=(True, 2, True)):
         matches = set()
         paths = []
         try:
@@ -675,6 +735,7 @@ class App(Tk):
                                 paths.append(file)
             self.queue_message("scan_total", len(paths))
             resolver = MetadataResolver(**configuration, tmdb_factory=TMDb)
+            discovered = []
             try:
                 for i, path in enumerate(sorted(paths, key=lambda p: str(p).lower()), 1):
                     title, year = filename_title_year(path)
@@ -683,9 +744,39 @@ class App(Tk):
                         movie.metadata, movie.match_state = resolver.lookup(path, title, year)
                     except Exception as e:
                         movie.match_state = "Lookup failed / needs review"
+                    discovered.append(movie)
                     self.queue_message("movie", (movie, i, len(paths)))
             finally:
                 resolver.close()
+            auto, minimum, missing_enabled = collection_options
+            if auto:
+                self.queue_message("collection_progress", None)
+                tmdb = None
+                try:
+                    if configuration["enabled"].get("TMDB") and configuration.get("tmdb_token"):
+                        tmdb = TMDb(configuration["tmdb_token"])
+                        # Enrich confident non-TMDB matches with franchise ID, but do
+                        # not overwrite their trusted cast/genre/studio metadata.
+                        for movie in discovered:
+                            if movie.match_state.startswith("Matched:") and not movie.metadata.get("collection_id"):
+                                try:
+                                    md, state = tmdb.lookup(movie.metadata.get("title") or movie.title,
+                                                            movie.metadata.get("year") or movie.year)
+                                except (RuntimeError, ValueError, OSError):
+                                    # An API outage must not prevent offline sorting.
+                                    continue
+                                if state == "Matched" and md.get("collection_id"):
+                                    old_name = movie.metadata.get("collection")
+                                    if not old_name or key_name(old_name) == key_name(md.get("collection")):
+                                        for k in ("collection", "collection_id", "tmdb_id"):
+                                            if not movie.metadata.get(k):
+                                                movie.metadata[k] = md.get(k)
+                    groups = collect(discovered, minimum,
+                                     tmdb.collection_parts if tmdb and missing_enabled else None)
+                finally:
+                    if tmdb:
+                        tmdb.close()
+                self.queue_message("collections", groups)
             self.queue_message("scan_done", None)
         except Exception as e:
             self.queue_message("error", str(e))
@@ -706,13 +797,24 @@ class App(Tk):
                 self.draw_movie(len(self.movies) - 1)
                 self.progress.configure(value=int(i * 100 / max(total, 1)))
                 self.status.set(f"Identified {i} of {total} files…")
+            elif kind == "collection_progress":
+                self.status.set("Identified video files. Looking for related films and checking collection catalogues…")
+            elif kind == "collections":
+                self.collection_groups = data
+                self.collection_membership = {str(movie.path): group
+                                              for group in data for movie in group.movies}
+                self.collections_btn.configure(state="normal" if data else "disabled")
+                self.refresh_preview()
             elif kind == "corrected":
                 index, title, year, metadata, state = data
                 movie = self.movies[index]
                 movie.title, movie.year, movie.metadata, movie.match_state = title, year, metadata, state
                 self.set_busy(False)
+                self.collection_groups = []
+                self.collection_membership = {}
+                self.collections_btn.configure(state="disabled")
                 self.refresh_preview()
-                self.status.set(f"Updated {movie.path.name}: {state}.")
+                self.status.set(f"Updated {movie.path.name}: {state}. Re-scan to update collections.")
             elif kind == "scan_done":
                 self.set_busy(False)
                 self.refresh_preview()
@@ -721,7 +823,9 @@ class App(Tk):
                     self.status.set("No movies found. If you used MOVE before, the originals are now in the destination. Add that destination as a source to re-sort them.")
                     messagebox.showinfo(APP_NAME, "No movie files found in the selected source folders.\n\nIf the first run used MOVE, the files are now in the destination folder. Choose that folder as a source and scan again.\n\nFor testing without removing source files, use COPY.")
                 else:
-                    self.status.set(f"Scan finished: {len(self.movies)} videos • {review_count} need metadata review. Check preview before organising.")
+                    found_missing = sum(len(c.missing) for c in self.collection_groups)
+                    self.status.set(f"Scan finished: {len(self.movies)} videos • {len(self.collection_groups)} collections"
+                                    f" • {found_missing} released titles absent from scanned folders • {review_count} need review.")
             elif kind == "work_progress":
                 i, total, outcome = data
                 self.progress.configure(value=int(i * 100 / max(total, 1)))
@@ -762,6 +866,19 @@ class App(Tk):
                 return None, "Selected actor not found in movie cast"
         field_checks = {"Genre": "genres", "Studio": "studios", "Lead Actor": "actors",
                         "Director": "directors", "Country": "countries", "Collection": "collection"}
+        # Collection routing has priority over the ordinary genre/year rules.
+        # It must still work for an NFO that only provides title + set name.
+        destination = Path(self.destination.get())
+        group = self.collection_membership.get(str(movie.path)) if self.auto_collections.get() else None
+        if group:
+            title = safe_name(md.get("title") or movie.title)
+            year = md.get("year") or movie.year
+            standard = f"{title} ({year})" if year else title
+            folder = destination / "Collections" / safe_name(group.name)
+            if self.movie_folder.get():
+                folder /= safe_name(standard)
+            stem = safe_name(standard) if self.rename.get() else safe_name(movie.path.stem)
+            return folder / (stem + movie.path.suffix), "Collection"
         for level in effective:
             if level in field_checks and not md.get(field_checks[level]):
                 return None, f"Needs metadata: {level}"
@@ -808,6 +925,108 @@ class App(Tk):
             "    |    Directors: " + (", ".join(md.get("directors") or []) or "Unknown") +
             "    |    Sources: " + (", ".join(md.get("sources") or []) or "Filename")
         )
+
+    def show_collections(self):
+        """Read-only collection and missing-movie dashboard; no file changes."""
+        if not self.collection_groups:
+            messagebox.showinfo(APP_NAME, "No collections with enough distinct owned titles were found in this scan.")
+            return
+        window = Toplevel(self)
+        window.title("MovieSort Pro V3 — Collections & Missing Movies")
+        window.geometry("1040x680")
+        window.minsize(780, 480)
+        window.configure(bg="#151a24")
+        frame = ttk.Frame(window, padding=14)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Movie collections", font=("Segoe UI", 17, "bold")).pack(anchor="w")
+        ttk.Label(frame, text="Missing = released films not identified anywhere in your selected source folders. "
+                  "Unknown catalogue status is NOT a complete collection.", wraplength=980).pack(anchor="w", pady=(4, 10))
+        columns = ("name", "owned", "missing", "upcoming", "status")
+        summaries = ttk.Treeview(frame, columns=columns, show="headings", height=8)
+        for name, caption, width in (("name", "Collection", 225), ("owned", "Owned", 65),
+                                     ("missing", "Missing", 80), ("upcoming", "Unreleased / undated", 130),
+                                     ("status", "Catalogue status", 380)):
+            summaries.heading(name, text=caption)
+            summaries.column(name, width=width, stretch=name in ("name", "status"))
+        summaries.pack(fill="x")
+        details_label = StringVar(value="Select a collection to see its films in series order.")
+        ttk.Label(frame, textvariable=details_label, wraplength=960).pack(anchor="w", pady=(12, 5))
+        detail_cols = ("order", "movie", "released", "state")
+        details = ttk.Treeview(frame, columns=detail_cols, show="headings")
+        for name, label, width in (("order", "#", 50), ("movie", "Film", 430),
+                                   ("released", "Year / Release", 155), ("state", "Status", 250)):
+            details.heading(name, text=label)
+            details.column(name, width=width, stretch=name == "movie")
+        details.pack(fill="both", expand=True)
+        missing_total = sum(len(group.missing) for group in self.collection_groups)
+        ttk.Label(frame, text=f"{len(self.collection_groups)} collections detected; {missing_total} released film(s) not found in scanned folders.").pack(anchor="w", pady=8)
+        for index, group in enumerate(self.collection_groups):
+            checked = group.catalogue_status == "Checked against TMDB"
+            summaries.insert("", "end", iid=str(index), values=(
+                group.name, group.count, len(group.missing) if checked else "?",
+                len(group.upcoming) if checked else "?", group.catalogue_status))
+
+        def selected_group():
+            selected = summaries.selection()
+            if not selected:
+                return None
+            return self.collection_groups[int(selected[0])]
+
+        def show_group(_event=None):
+            group = selected_group()
+            if group is None:
+                return
+            for item in details.get_children():
+                details.delete(item)
+            details_label.set(group.name + " — " + group.catalogue_status)
+            # Use the TMDB release-order catalogue where available. Explicit
+            # collection_order from the user's catalogue wins over release order.
+            sorted_owned = sorted(group.owned, key=lambda movie: movie_order(movie, group))
+            for index, movie in enumerate(sorted_owned, 1):
+                md = movie.metadata
+                title = md.get("title") or movie.title
+                year = md.get("year") or movie.year or "Unknown"
+                details.insert("", "end", values=(index, title, str(year), "In scanned library"))
+            for part in group.ordered_parts:
+                if part not in group.missing and part not in group.upcoming:
+                    continue
+                missing = part in group.missing
+                details.insert("", "end", values=("—", part.get("title", ""),
+                                  part.get("release_date") or "Date unknown",
+                                  "MISSING (released)" if missing else "Upcoming / release date unconfirmed"))
+        summaries.bind("<<TreeviewSelect>>", show_group)
+        if self.collection_groups:
+            summaries.selection_set("0")
+            show_group()
+
+        def export_missing():
+            target = filedialog.asksaveasfilename(parent=window, title="Export missing movies",
+                        defaultextension=".csv", initialfile="MovieSortPro-Missing-Movies.csv",
+                        filetypes=[("CSV", "*.csv"), ("Text file", "*.txt")])
+            if not target:
+                return
+            rows = [(group.name, part.get("title", ""), part.get("release_date", ""),
+                     "Missing from scanned folders")
+                    for group in self.collection_groups for part in group.missing]
+            try:
+                if Path(target).suffix.lower() == ".txt":
+                    with open(target, "w", encoding="utf-8") as f:
+                        if not rows:
+                            f.write("No confirmed missing released titles among checked collections.\n")
+                        for collection, title, release, status in rows:
+                            f.write(f"{collection}: {title} ({release}) — {status}\n")
+                else:
+                    with open(target, "w", newline="", encoding="utf-8-sig") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(("Collection", "Movie", "Release Date", "Status"))
+                        writer.writerows(rows)
+                messagebox.showinfo(APP_NAME, f"Missing movie report saved:\n{target}", parent=window)
+            except OSError as exc:
+                messagebox.showerror(APP_NAME, f"Could not export report: {exc}", parent=window)
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x", pady=(8, 0))
+        ttk.Button(bar, text="Export missing list (CSV/TXT)", command=export_missing).pack(side="left")
+        ttk.Button(bar, text="Close", command=window.destroy).pack(side="right")
 
     def correct_selected(self):
         if self.busy:

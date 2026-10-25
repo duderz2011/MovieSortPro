@@ -2,7 +2,7 @@
 
 **MovieSort Pro** is a free, open-source Windows movie library organiser. Point it at one or more folders containing movies, fetch available film metadata, choose how you want files grouped, review the proposed changes, and copy or move the files into a new folder structure.
 
-> **Status:** v2.1 community preview. The automated unit tests pass, but Windows packaging, network metadata services and large-library edge cases still need community testing. Start with **Copy** and a small sample library; keep backups.
+> **Status:** v3 community preview. The automated unit tests pass, but Windows packaging, network metadata services and large-library edge cases still need community testing. Start with **Copy** and a small sample library; keep backups.
 
 ## Features
 
@@ -13,6 +13,9 @@
 - **Copy** (default) or **Move**, optionally renaming movie files and including matching subtitles, NFOs and artwork.
 - Skip exact destination duplicates using SHA-256 checks. Different files are given distinct names, not overwritten.
 - Reorganise an already-sorted folder, including using the same source and destination.
+- **V3 Collections:** automatically group two or more distinct owned movies in `Collections/<Series Name>/`, while other movies stay on their normal sorting paths.
+- **Missing sequels:** use TMDB collection catalogues to flag released movies not found in **all scanned source folders**, distinguish upcoming and undated titles, show a collection dashboard, and export missing-film lists to CSV/TXT.
+- **Series ordering:** show films in manual `collection_order` order where provided, otherwise TMDB release-date order. TMDB does not guarantee narrative order. The files keep Plex-friendly names without injected numbering.
 - Keep a CSV report and a best-effort *Undo Last Move* journal.
 - Save UI preferences between launches; on Windows, optional API credentials are encrypted with the current user's Windows Data Protection API (DPAPI).
 
@@ -42,13 +45,15 @@ Install Python 3.10+, then run `Build-Windows-EXE.bat`. This installs PyInstalle
 2. Open **Configure Metadata Sources**, enable providers, and set their priority. Enter TMDB/OMDb credentials only if you want those providers.
 3. Select a sorting preset or configure up to 3 levels (for example, `Genre / Year / Movie Title`).
 4. Keep the operation on **Copy** when testing.
-5. Click **Scan & Identify**, review all proposed destinations, and then **Organise Movies**.
-6. Open **Last Report** for successes, skips or errors.
+5. Leave **Automatically organise movie collections** enabled (default minimum: 2 films) to route qualifying sets to `Collections/Series Name/`. Click **Collections / Missing Movies** after scanning to review present, missing and upcoming titles. Collection groups can be detected offline using NFO/catalogue data; **missing-title verification requires an enabled TMDB source and a valid TMDB token**.
+6. Click **Scan & Identify**, review all proposed destinations, and then **Organise Movies**.
+7. Open **Last Report** for successes, skips or errors.
 
 **Sample paths:**
 
 ```text
 D:\Movies\Action\2024\Example Movie (2024)\Example Movie (2024).mkv
+D:\Movies\Collections\The Mighty Ducks Collection\D3_ The Mighty Ducks (1996).mkv
 D:\Movies\Universal Pictures\A-P\Another Film (2021).mp4
 ```
 
@@ -87,6 +92,11 @@ Windows stores API credentials encrypted with the signed-in user's DPAPI. On pla
 ## Limitations and safety
 
 - Actual video contents are not analysed: lookup relies on filename and metadata clues.
+- The missing-films dashboard describes titles **not found in the selected scanned folders**, not a judgement about what you own elsewhere. Uncertain matches, API failures and groups without TMDB IDs are not labelled complete.
+- Missing-title detection reports franchises only after **at least two different films** in that series are found locally. Duplicate encodes do not qualify.
+- TMDB's collection membership and release chronology may differ from a film's narrative viewing order; supply `collection_order` through a CSV/JSON catalogue to override ordering in the dashboard.
+- Online collection API calls may take time for a large library; cached collection details are used for 30 days. Existing collection reports need a rescan to refresh.
+
 - A film with multiple genres/studios/actors currently uses the selected first match for folder grouping. It does not make one copy per category.
 - Metadata availability, rate limits and licences vary by provider.
 - File moves, hashing and copying across network shares may take considerable time. Interrupted operations can need manual review.
@@ -95,7 +105,7 @@ Windows stores API credentials encrypted with the signed-in user's DPAPI. On pla
 
 ## Test and contribute
 
-Unit tests:
+Unit tests (including V3 collection inventory tests):
 
 ```powershell
 python -m unittest discover -v
@@ -105,12 +115,16 @@ python -m unittest discover -v
 
 Bug reports and contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md) first. When reporting a bug, include Windows version, app version, what happened on the first and second attempts, and **redacted** report entries. Never attach private media filenames or API keys without removing them.
 
+For local desktop smoke tests: `python smoke_gui.py`, `python gui_collections_test.py`, and `python gui_reruns_test.py` (requires a desktop display / Xvfb on Linux).
+
 ## Community roadmap
 
 - More reliable rescan/resume logic and explicit dry-run export.
 - Additional metadata provider adapters (subject to provider policies).
 - Manual review and correction of ambiguous movie matches.
-- Better handling of multiple genres, collections, and duplicate sets.
+- Further handling of multiple genres and duplicate sets.
+- Optional per-collection `Missing Movies.txt` export into the destination folder (currently manual CSV/TXT only).
+- MP4 remux / Plex optimisation as a separate future feature (not yet implemented).
 - Installer, digital signing, and broader Windows testing.
 
 ## Licence

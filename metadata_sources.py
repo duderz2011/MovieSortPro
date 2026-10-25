@@ -17,7 +17,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 PROVIDERS = ("Local NFO", "Local Catalogue", "TMDB", "OMDb", "Wikidata")
-FIELDS = ("title", "year", "genres", "studios", "actors", "directors", "countries", "collection", "plot", "imdb_id", "tmdb_id", "poster")
+FIELDS = ("title", "year", "genres", "studios", "actors", "directors", "countries", "collection", "collection_id", "collection_order", "plot", "imdb_id", "tmdb_id", "poster")
 LIST_FIELDS = {"genres", "studios", "actors", "directors", "countries"}
 
 
@@ -129,7 +129,8 @@ def get_local_nfo(video: Path) -> dict:
                 "genres": many("genre"), "studios": many("studio"),
                 "actors": [x for x in actors if x], "directors": many("director"),
                 "countries": many("country"), "plot": txt("plot"),
-                "collection": txt("set/name"),
+                "collection": txt("set/name"), "collection_id": txt("set/tmdbid"),
+                "collection_order": txt("collection_order"),
                 "imdb_id": next(((e.text or "").strip() for e in root.findall("uniqueid") if e.get("type") == "imdb"), "") or txt("imdbid"),
                 "tmdb_id": next(((e.text or "").strip() for e in root.findall("uniqueid") if e.get("type") == "tmdb"), ""),
             })
@@ -169,7 +170,8 @@ class LocalCatalogue:
                 "actors": low.get("actors") or low.get("actor") or low.get("cast"),
                 "directors": low.get("directors") or low.get("director"),
                 "countries": low.get("countries") or low.get("country"),
-                "collection": low.get("collection"), "plot": low.get("plot"),
+                "collection": low.get("collection"), "collection_id": low.get("collection_id"),
+                "collection_order": low.get("collection_order") or low.get("series_order"), "plot": low.get("plot"),
                 "imdb_id": low.get("imdb_id") or low.get("imdbid"),
                 "tmdb_id": low.get("tmdb_id"),
             })

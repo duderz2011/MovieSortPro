@@ -3,6 +3,7 @@
 Run: xvfb-run -a python test_reruns_gui.py (Linux). On Windows: python test_reruns_gui.py
 """
 import os
+import gc
 import tempfile
 import time
 from pathlib import Path
@@ -71,6 +72,7 @@ with tempfile.TemporaryDirectory() as d:
         assert not organised.exists()
         app.save_preferences()
         app.destroy()
+        gc.collect()  # Tk variables from closed windows must be finalized on main thread.
     # Relaunch should preserve folder selection and sorting rules.
     reloaded=App();reloaded.withdraw()
     assert reloaded.sources==[dst],reloaded.sources
@@ -78,6 +80,7 @@ with tempfile.TemporaryDirectory() as d:
     assert [x.get() for x in reloaded.levels[:2]]==['Year','Genre']
     assert reloaded.mode.get()=='Move'
     reloaded.destroy()
+    gc.collect()
 
 with tempfile.TemporaryDirectory() as d:
     os.environ['LOCALAPPDATA']=str(Path(d)/'LocalAppData')
