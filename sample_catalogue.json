@@ -1,0 +1,15 @@
+{
+  "movies": [
+    {
+      "filename": "Sample.Movie.2024.mkv",
+      "title": "Sample Movie",
+      "year": 2024,
+      "genres": ["Action", "Adventure"],
+      "studios": ["Example Studio"],
+      "actors": ["Actor One", "Actor Two"],
+      "directors": ["Director One"],
+      "countries": ["United Kingdom"],
+      "collection": "Sample Collection"
+    }
+  ]
+}

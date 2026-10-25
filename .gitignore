@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# User-specific data (never commit)
+preferences.json
+metadata_cache.db
+last_run.json
+last_run_report.csv
+*.log
+.env
+.env.*
+!.env.example
+*.local.json
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

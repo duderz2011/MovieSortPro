@@ -1,0 +1,102 @@
+MOVIESORT PRO V2.1 — WINDOWS MOVIE LIBRARY ORGANISER
+=====================================================
+
+IMPORTANT FIXES FOR SECOND / REPEATED RUNS
+------------------------------------------
+V2 originally defaulted to MOVE, so after your first successful run, the files
+were no longer in the original source folder. Another scan found 0 films.
+
+V2.1 now:
+- Defaults to COPY, so a test does not remove movies from the source.
+- Explains exactly what to do when the source is empty after a MOVE.
+- Remembers source folders, destination folder, sorting rules, enabled metadata
+  sources and chosen action between launches.
+- Remembers TMDB / OMDb credentials on Windows, encrypted with Windows DPAPI
+  for the signed-in Windows user (not plaintext). When encryption is unavailable,
+  credentials are NOT saved and need to be entered again.
+- Allows you to scan and organise INSIDE THE SAME FOLDER for re-sorting an
+  already-organised library (source and destination can be identical).
+- Skips a file already at its exact destination instead of creating [2] copies.
+- Skips duplicate destination files by SHA-256 rather than copying them again.
+- Gives a clearer report showing moved/copied, already present, and failed.
+- Adds OPEN LAST REPORT to inspect every processed file.
+
+IF THE FIRST TEST WORKED, BUT THE SECOND DOES NOT
+------------------------------------------------
+1. Look at your original source folder in Windows File Explorer.
+2. If the movie files have disappeared from it, the previous run used MOVE.
+   They should now be under the destination folder chosen for the first run.
+3. To re-sort the already-organised library:
+   - Remove the old source folder using REMOVE SELECTED.
+   - Add the destination folder as your SOURCE.
+   - Set that SAME folder as your DESTINATION if you want in-place sorting.
+   - Change your folder rules and press SCAN & IDENTIFY.
+   - Check every proposed destination, then ORGANISE MOVIES.
+4. For ordinary test runs, select COPY first. Running again with the same
+   settings should skip identical destination movies (this is expected).
+5. To find errors, click OPEN LAST REPORT, or open:
+   %LOCALAPPDATA%\MovieSortPro\last_run_report.csv
+6. If metadata is missing, open CONFIGURE METADATA SOURCES, confirm TMDB and/or
+   OMDb credentials, and check your internet connection or NFO/catalogue input.
+7. If you cannot see any films, confirm the selected source folder actually
+   contains .mkv, .mp4, .avi etc, and that the drive is still connected.
+
+HOW TO RUN
+----------
+1. Extract the ZIP and double-click Run-MovieSortPro.bat on a Windows PC with
+   Python 3.10 or later installed from https://www.python.org/downloads/windows/
+2. Alternatively, double-click Build-Windows-EXE.bat to use PyInstaller and
+   build dist\MovieSortPro.exe locally. The ZIP does NOT include an .exe.
+3. Choose one or more folders to scan, and a destination folder.
+4. Click CONFIGURE METADATA SOURCES to select metadata providers and priorities.
+5. Choose custom sorting levels (up to 3), e.g. Genre / Year / Movie Title.
+6. Leave Action: COPY for your first tests; select MOVE only after checking.
+7. Click SCAN & IDENTIFY. Review every destination, then ORGANISE MOVIES.
+8. Click OPEN LAST REPORT to inspect successes, skips and errors.
+
+METADATA SOURCES
+----------------
+- Local NFO: Movie-specific .nfo and single-movie folder-level movie.nfo.
+- Local Catalogue: CSV or JSON; sample_catalogue.csv and .json are provided.
+- TMDB: https://www.themoviedb.org/settings/api — API Read Access Token.
+- OMDb: https://www.omdbapi.com/apikey.aspx — OMDb API key.
+- Wikidata: Public film metadata, without an API key; slower and sometimes sparse.
+
+Metadata sources are processed in your chosen priority order. Missing attributes
+can optionally be supplemented by another confidently matching source.
+
+OTHER FEATURES
+--------------
+- Custom 3-level folder paths by genre, studio, lead or selected actor, director,
+  country, collection, alphabet buckets, letter, year, decade or movie title.
+- Optional renamed movie files in the style "Title (Year).mkv".
+- Move/copy matching subtitle files, local NFOs and artwork (when unambiguous).
+- Preview before making changes. Files with missing required metadata are skipped.
+- Existing files are never intentionally overwritten. Different contents get
+  numbered suffixes; identical files are skipped after SHA-256 verification.
+- UNDO LAST MOVE is best-effort and cannot undo COPIES. It will not overwrite.
+
+FILES & DATA
+------------
+UI settings: %LOCALAPPDATA%\MovieSortPro\preferences.json
+Metadata cache: %LOCALAPPDATA%\MovieSortPro\metadata_cache.db
+Undo journal: %LOCALAPPDATA%\MovieSortPro\last_run.json
+CSV report: %LOCALAPPDATA%\MovieSortPro\last_run_report.csv
+
+SECURITY & LIMITATIONS
+----------------------
+- V2.1 was exercised with automated file-system tests and a Linux virtual GUI.
+  The Windows build, actual online API calls, and Windows-only DPAPI credential
+  storage still need testing on a Windows PC.
+- Filenames/NFOs are used to identify films; video pixels aren't analysed.
+- Multiple genres/studios/actors use the first result rather than copying
+  the same film into many categories.
+- Metadata providers may have rate limits or licensing requirements.
+- Always test on a small sample and keep backups for important files.
+- On large network shares, scanning, hashing duplicates, copying, and moving
+  videos across different drives can take a long time.
+
+TESTS
+-----
+python -m unittest -v
+python gui_reruns_test.py (requires a display)
