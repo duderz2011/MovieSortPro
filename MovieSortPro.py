@@ -25,6 +25,7 @@ from typing import Optional
 from metadata_sources import PROVIDERS, MetadataResolver
 from movie_collections import collect, movie_order, key_name
 from preferences import read_preferences, write_preferences, seal, unseal
+from library_maintenance import no_video_folders, prune_empty_tree, safe_to_recycle, recycle, lower_quality_duplicates
 
 APP_NAME = "MovieSort Pro"
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".wmv", ".mov", ".mpg", ".mpeg", ".webm", ".ts", ".m2ts", ".iso"}
@@ -90,6 +91,41 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def cleanup_empty_source_dirs(moved_origins, source_roots, destination=None) -> int:
+    """Remove only source subdirectories made empty by successful file moves.
+
+    NEVER delete a user-selected source root, the destination root, symlinks,
+    or folders with any files/other directories. Existing files are not touched.
+    """
+    roots = {Path(p).resolve() for p in source_roots}
+    dest = Path(destination).resolve() if destination else None
+    if not roots:
+        return 0
+    candidates = set()
+    for original in moved_origins:
+        directory = Path(original).parent
+        for root in roots:
+            # Use the path's symlink-free ancestry, and never walk above a root.
+            if directory == root or not directory.is_relative_to(root):
+                continue
+            while directory != root:
+                if directory.is_symlink():
+                    break
+                if dest is None or directory != dest:
+                    candidates.add(directory)
+                directory = directory.parent
+    count = 0
+    for folder in sorted(candidates, key=lambda x: len(x.parts), reverse=True):
+        if folder in roots or (dest is not None and folder == dest) or folder.is_symlink():
+            continue
+        try:
+            folder.rmdir()  # Atomic: fails if even a hidden file or subfolder remains.
+            count += 1
+        except OSError:
+            pass
+    return count
+
+
 @dataclass
 class Movie:
     path: Path
@@ -130,7 +166,7 @@ class TMDb:
         raise RuntimeError("TMDB lookup failed")
 
     def lookup(self, title: str, year: Optional[int]) -> tuple[dict, str]:
-        key = f"v2|{normalize(title)}|{year or ''}"
+        key = f"v3.2|{normalize(title)}|{year or ''}"
         cached = self.conn.execute("SELECT value FROM movies WHERE lookup_key=?", (key,)).fetchone()
         if cached:
             saved = json.loads(cached[0])
@@ -139,24 +175,38 @@ class TMDb:
             # Refresh that entry on demand so V3 can detect absent sequels.
             if not (prior.get("collection") and not prior.get("collection_id") and prior.get("tmdb_id")):
                 return prior, saved["state"]
-        params = {"query": title, "include_adult": "false", "language": "en-GB"}
+        # Try a year-filtered search first. If it fails, broaden without the year,
+        # because original/theatrical/UK release years can differ.
+        queries = [{"query": title, "include_adult": "false", "language": "en-GB"}]
         if year:
-            params["year"] = year
-        results = self.get("search/movie", params).get("results", [])
-        if not results and year:
-            params.pop("year")
-            results = self.get("search/movie", params).get("results", [])
+            queries.insert(0, {**queries[0], "year": year})
+        found = {}
         scored = []
-        for result in results:
-            options = [result.get("title", ""), result.get("original_title", "")]
-            title_score = max(SequenceMatcher(None, normalize(title), normalize(t)).ratio() for t in options)
-            release_year = int(result.get("release_date", "0000")[:4] or 0)
-            penalty = 0 if not year or release_year == year else (0.08 if abs(release_year - year) == 1 else 0.32)
-            scored.append((title_score - penalty, result))
-        scored.sort(key=lambda pair: pair[0], reverse=True)
-        if not scored or scored[0][0] < 0.76:
+        for params in queries:
+            results = self.get("search/movie", params).get("results", [])
+            for result in results:
+                movie_id = result.get("id")
+                if not movie_id:
+                    continue
+                options = [result.get("title") or "", result.get("original_title") or ""]
+                title_score = max((SequenceMatcher(None, normalize(title), normalize(t)).ratio()
+                                   for t in options if t), default=0)
+                release_year = int((result.get("release_date") or "0000")[:4] or 0)
+                # Never automatically substitute a similarly named remake from a different year.
+                if year and release_year and abs(release_year - year) > 1:
+                    continue
+                score = title_score + (0.04 if year and release_year == year else 0)
+                if year and not release_year:
+                    score -= 0.03
+                if score > found.get(movie_id, (-1, {}))[0]:
+                    found[movie_id] = (score, result)
+            scored = sorted(found.values(), key=lambda pair: pair[0], reverse=True)
+            threshold = 0.88 if year else 0.92
+            if scored and scored[0][0] >= threshold and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.045):
+                break
+        if not scored or scored[0][0] < (0.88 if year else 0.92):
             return {}, "Needs review: no confident match"
-        if len(scored) > 1 and (scored[0][0] - scored[1][0]) < 0.035:
+        if len(scored) > 1 and scored[0][0] - scored[1][0] < 0.045:
             return {}, "Needs review: ambiguous match"
         result = scored[0][1]
         details = self.get(f"movie/{result['id']}", {"append_to_response": "credits", "language": "en-GB"})
@@ -338,7 +388,7 @@ def choose_target(source: Path, desired: Path, reserved: set[str]) -> tuple[Opti
 class App(Tk):
     def __init__(self):
         super().__init__()
-        self.title(APP_NAME + " V3.1 — Movie Library & Collections")
+        self.title(APP_NAME + " V3.3 — Smarter Metadata & Library Cleanup")
         self.geometry("1220x790")
         self.minsize(950, 650)
         self.configure(bg="#151a24")
@@ -365,6 +415,7 @@ class App(Tk):
         self.destination = StringVar()
         self.token = StringVar()
         self.omdb_key = StringVar()
+        self.trakt_key = StringVar()
         self.catalogue_path = StringVar()
         self.source_priority = list(PROVIDERS)
         self.source_enabled = {name: BooleanVar(value=True) for name in PROVIDERS}
@@ -377,6 +428,10 @@ class App(Tk):
         self.movie_folder = BooleanVar(value=False)
         self.include_sidecars = BooleanVar(value=True)
         self.route_unmatched = BooleanVar(value=True)
+        self.remove_empty_folders = BooleanVar(value=True)
+        self.scan_empty_folders = BooleanVar(value=True)
+        self.no_video_candidates = []
+        self.duplicate_suggestions = []
         self.auto_collections = BooleanVar(value=True)
         self.collection_minimum = StringVar(value="2")
         self.check_missing = BooleanVar(value=True)
@@ -402,6 +457,7 @@ class App(Tk):
             self.mode.set(saved["mode"])
         for name, var in (("rename", self.rename), ("movie_folder", self.movie_folder),
                           ("include_sidecars", self.include_sidecars), ("route_unmatched", self.route_unmatched),
+                          ("remove_empty_folders", self.remove_empty_folders), ("scan_empty_folders", self.scan_empty_folders),
                           ("merge_metadata", self.merge_metadata),
                           ("auto_collections", self.auto_collections), ("check_missing", self.check_missing)):
             if isinstance(saved.get(name), bool):
@@ -413,8 +469,11 @@ class App(Tk):
                 if level in CUSTOM_LEVELS:
                     var.set(level)
         priority = saved.get("source_priority", [])
-        if isinstance(priority, list) and set(priority) == set(PROVIDERS) and len(priority) == len(PROVIDERS):
-            self.source_priority = priority
+        if isinstance(priority, list):
+            # Preserve existing user priorities when new providers are added.
+            filtered = [name for name in priority if name in PROVIDERS]
+            if len(set(filtered)) == len(filtered):
+                self.source_priority = filtered + [p for p in PROVIDERS if p not in filtered]
         enabled = saved.get("source_enabled", {})
         if isinstance(enabled, dict):
             for provider in PROVIDERS:
@@ -423,6 +482,7 @@ class App(Tk):
         # On Windows, credentials are encrypted with the signed-in user's DPAPI key.
         self.token.set(unseal(saved.get("tmdb_protected", "")))
         self.omdb_key.set(unseal(saved.get("omdb_protected", "")))
+        self.trakt_key.set(unseal(saved.get("trakt_protected", "")))
 
     def save_preferences(self):
         prefs = {
@@ -433,6 +493,8 @@ class App(Tk):
             "rename": self.rename.get(), "movie_folder": self.movie_folder.get(),
             "include_sidecars": self.include_sidecars.get(),
             "route_unmatched": self.route_unmatched.get(),
+            "remove_empty_folders": self.remove_empty_folders.get(),
+            "scan_empty_folders": self.scan_empty_folders.get(),
             "auto_collections": self.auto_collections.get(),
             "collection_minimum": self.collection_minimum.get(),
             "check_missing": self.check_missing.get(),
@@ -442,6 +504,7 @@ class App(Tk):
             "catalogue_path": self.catalogue_path.get(),
             "tmdb_protected": seal(self.token.get()),
             "omdb_protected": seal(self.omdb_key.get()),
+            "trakt_protected": seal(self.trakt_key.get()),
         }
         try:
             write_preferences(app_dir() / "preferences.json", prefs)
@@ -458,11 +521,12 @@ class App(Tk):
         """Display metadata provider credits without exposing user API credentials."""
         messagebox.showinfo(
             "About MovieSort Pro / Credits",
-            "MovieSort Pro V3.1\nFree and open-source movie organiser (MIT).\n\n"
+            "MovieSort Pro V3.2\nFree and open-source movie organiser (MIT).\n\n"
             "This product uses the TMDB API but is not endorsed or certified by TMDB.\n"
             "TMDB: https://www.themoviedb.org\n\n"
             "Other optional sources: OMDb (https://www.omdbapi.com), "
-            "Wikidata (https://www.wikidata.org), local NFO and CSV/JSON.\n\n"
+            "Wikidata (https://www.wikidata.org), Apple Movies (https://www.apple.com), "
+            "Trakt (https://trakt.tv), local NFO and CSV/JSON.\n\n"
             "No API keys are included with this application."
         )
 
@@ -548,6 +612,14 @@ class App(Tk):
         ttk.Checkbutton(row2, text="Bring matching subtitles and artwork", variable=self.include_sidecars).pack(side="left", padx=(19, 0))
         ttk.Checkbutton(row2, text="Send unidentified films to unmatched", variable=self.route_unmatched,
                         command=self.refresh_preview).pack(side="left", padx=(19, 0))
+        ttk.Checkbutton(row2, text="Delete EMPTY source subfolders after Move",
+                        variable=self.remove_empty_folders).pack(side="left", padx=(19, 0))
+        cleanup_row = ttk.Frame(settings)
+        cleanup_row.pack(fill="x", pady=(6, 0))
+        ttk.Checkbutton(cleanup_row, text="Automatically remove completely EMPTY source folders during scan",
+                        variable=self.scan_empty_folders).pack(side="left")
+        ttk.Label(cleanup_row, text="Non-movie files and lower-quality duplicates require explicit Recycle Bin confirmation.",
+                  font=("Segoe UI", 9)).pack(side="left", padx=(12, 0))
         collection_row = ttk.Frame(settings)
         collection_row.pack(fill="x", pady=(8, 0))
         ttk.Checkbutton(collection_row, text="Automatically organise movie collections", variable=self.auto_collections,
@@ -568,6 +640,12 @@ class App(Tk):
         self.collections_btn = ttk.Button(action, text="Collections / Missing Movies", command=self.show_collections,
                                           state="disabled")
         self.collections_btn.pack(side="left", padx=5)
+        self.review_folders_btn = ttk.Button(action, text="Review Movie-Free Folders",
+                                              command=self.review_movie_free_folders, state="disabled")
+        self.review_folders_btn.pack(side="left", padx=4)
+        self.review_dupes_btn = ttk.Button(action, text="Review Duplicates",
+                                            command=self.review_duplicates, state="disabled")
+        self.review_dupes_btn.pack(side="left", padx=4)
         ttk.Button(action, text="Correct Selected Match", command=self.correct_selected).pack(side="left", padx=(6, 8))
         ttk.Button(action, text="Undo Last Move", command=self.undo_last_move).pack(side="right")
         ttk.Button(action, text="Open Last Report", command=self.open_last_report).pack(side="right", padx=8)
@@ -622,7 +700,7 @@ class App(Tk):
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="Enabled metadata sources (highest priority first)", font=("Segoe UI", 12, "bold")).pack(anchor="w")
         ttk.Label(frame, text="Select a source, then move it up or down. Disable any provider you don't want queried.").pack(anchor="w", pady=(3, 10))
-        source_list = Listbox(frame, height=5, bg="#202838", fg="white", selectbackground="#35629b")
+        source_list = Listbox(frame, height=7, bg="#202838", fg="white", selectbackground="#35629b")
         source_list.pack(fill="x")
         priority = self.source_priority.copy()
         def populate(select=None):
@@ -658,6 +736,8 @@ class App(Tk):
         ttk.Entry(frame, textvariable=self.token, show="•").pack(fill="x", pady=(3, 10))
         ttk.Label(frame, text="OMDb API Key").pack(anchor="w")
         ttk.Entry(frame, textvariable=self.omdb_key, show="•").pack(fill="x", pady=(3, 10))
+        ttk.Label(frame, text="Trakt API client ID (optional, public movie search)").pack(anchor="w")
+        ttk.Entry(frame, textvariable=self.trakt_key, show="•").pack(fill="x", pady=(3, 10))
         ttk.Label(frame, text="Local CSV / JSON catalogue (optional)").pack(anchor="w")
         path_frame = ttk.Frame(frame)
         path_frame.pack(fill="x", pady=(3, 4))
@@ -667,7 +747,7 @@ class App(Tk):
             if picked:
                 self.catalogue_path.set(picked)
         ttk.Button(path_frame, text="Browse…", command=browse).pack(side="left", padx=(6, 0))
-        ttk.Label(frame, text="NFO and Wikidata require no API key. On Windows, API keys are saved using user-bound DPAPI encryption.", font=("Segoe UI", 9)).pack(anchor="w", pady=(6, 0))
+        ttk.Label(frame, text="NFO, Wikidata and Apple Movies need no key. TMDB, OMDb and Trakt are opt-in and require credentials. Keys use Windows DPAPI.", font=("Segoe UI", 9)).pack(anchor="w", pady=(6, 0))
         def save():
             self.source_priority = priority
             self.update_source_summary()
@@ -702,6 +782,8 @@ class App(Tk):
         self.busy = busy
         self.scan_btn.configure(state="disabled" if busy else "normal")
         self.go_btn.configure(state="disabled" if busy or not any(m.target and m.path.exists() for m in self.movies) else "normal")
+        self.review_folders_btn.configure(state="disabled" if busy or not self.no_video_candidates else "normal")
+        self.review_dupes_btn.configure(state="disabled" if busy or not self.duplicate_suggestions else "normal")
 
     def scan(self):
         if self.busy:
@@ -719,19 +801,21 @@ class App(Tk):
         self.movies = []
         self.collection_groups = []
         self.collection_membership = {}
+        self.no_video_candidates = []
+        self.duplicate_suggestions = []
         self.collections_btn.configure(state="disabled")
         for item in self.tree.get_children():
             self.tree.delete(item)
         self.progress.configure(value=0)
         self.set_busy(True)
         configuration = dict(priority=list(self.source_priority), enabled={k: v.get() for k, v in self.source_enabled.items()},
-                             tmdb_token=self.token.get(), omdb_key=self.omdb_key.get(),
+                             tmdb_token=self.token.get(), omdb_key=self.omdb_key.get(), trakt_key=self.trakt_key.get(),
                              catalogue_path=self.catalogue_path.get(), merge=self.merge_metadata.get())
         collection_options = (self.auto_collections.get(), int(self.collection_minimum.get()),
                               self.check_missing.get())
-        threading.Thread(target=self.scan_thread, args=(dest, configuration, collection_options), daemon=True).start()
+        threading.Thread(target=self.scan_thread, args=(dest, configuration, collection_options, self.scan_empty_folders.get()), daemon=True).start()
 
-    def scan_thread(self, destination: Path, configuration: dict, collection_options=(True, 2, True)):
+    def scan_thread(self, destination: Path, configuration: dict, collection_options=(True, 2, True), prune_on_scan=False):
         matches = set()
         paths = []
         try:
@@ -797,6 +881,17 @@ class App(Tk):
                     if tmdb:
                         tmdb.close()
                 self.queue_message("collections", groups)
+            suggestions = lower_quality_duplicates(discovered)
+            self.queue_message("duplicates", suggestions)
+            # Scan entire source subtrees, rather than treating a folder of movie
+            # artwork/subtitles as empty. Never delete non-movie files on a scan.
+            folders = no_video_folders(self.sources, destination, VIDEO_EXTENSIONS)
+            removed_empty = 0
+            if prune_on_scan:
+                for candidate in folders:
+                    removed_empty += prune_empty_tree(candidate.path, self.sources, destination)
+                folders = no_video_folders(self.sources, destination, VIDEO_EXTENSIONS)
+            self.queue_message("movie_free_folders", (folders, removed_empty))
             self.queue_message("scan_done", None)
         except Exception as e:
             self.queue_message("error", str(e))
@@ -835,6 +930,27 @@ class App(Tk):
                 self.collections_btn.configure(state="disabled")
                 self.refresh_preview()
                 self.status.set(f"Updated {movie.path.name}: {state}. Re-scan to update collections.")
+            elif kind == "duplicates":
+                self.duplicate_suggestions = data
+                self.review_dupes_btn.configure(state="normal" if data else "disabled")
+            elif kind == "movie_free_folders":
+                folders, removed = data
+                self.no_video_candidates = [x for x in folders if x.contains_other_files]
+                self.review_folders_btn.configure(state="normal" if self.no_video_candidates else "disabled")
+                if removed:
+                    self.details.set(f"Scan cleaned {removed} genuinely empty source subfolder(s). Other files were not deleted.")
+            elif kind == "cleanup_complete":
+                self.set_busy(False)
+                self.no_video_candidates = []
+                self.review_folders_btn.configure(state="disabled")
+                self.status.set(data)
+                messagebox.showinfo(APP_NAME, data)
+            elif kind == "duplicates_complete":
+                self.set_busy(False)
+                self.duplicate_suggestions = []
+                self.review_dupes_btn.configure(state="disabled")
+                self.status.set(data)
+                messagebox.showinfo(APP_NAME, data + "\nRescan your library to refresh the preview.")
             elif kind == "scan_done":
                 self.set_busy(False)
                 self.refresh_preview()
@@ -845,7 +961,9 @@ class App(Tk):
                 else:
                     found_missing = sum(len(c.missing) for c in self.collection_groups)
                     self.status.set(f"Scan finished: {len(self.movies)} videos • {len(self.collection_groups)} collections"
-                                    f" • {found_missing} released titles absent from scanned folders • {review_count} unmatched / need review.")
+                                    f" • {found_missing} missing sequels • {review_count} unmatched"
+                                    f" • {len(self.duplicate_suggestions)} quality duplicate suggestion(s)"
+                                    f" • {len(self.no_video_candidates)} movie-free folder(s) for review.")
             elif kind == "work_progress":
                 i, total, outcome = data
                 self.progress.configure(value=int(i * 100 / max(total, 1)))
@@ -1056,6 +1174,77 @@ class App(Tk):
         ttk.Button(bar, text="Export missing list (CSV/TXT)", command=export_missing).pack(side="left")
         ttk.Button(bar, text="Close", command=window.destroy).pack(side="right")
 
+    def review_movie_free_folders(self):
+        """Explicitly approve sending NON-EMPTY, movie-free folders to Recycle Bin."""
+        if self.busy or not self.no_video_candidates:
+            messagebox.showinfo(APP_NAME, "No non-empty movie-free folders require review.")
+            return
+        candidates = [x for x in self.no_video_candidates if safe_to_recycle(
+            x.path, self.sources, Path(self.destination.get()), VIDEO_EXTENSIONS)]
+        if not candidates:
+            messagebox.showwarning(APP_NAME, "Folder contents changed; rescan before continuing.")
+            return
+        lines = "\n".join(str(x.path) for x in candidates)
+        if not messagebox.askyesno(APP_NAME,
+                f"Send {len(candidates)} movie-free folder(s) AND ALL THEIR CONTENTS to the Recycle Bin?"
+                "\n\nThese folders contain non-movie files (e.g. images, text or subtitles)."
+                " They will NOT be permanently deleted. Only proceed if you do not need them."
+                f"\n\n{lines[:2800]}\n\nThis action is separate from Copy/Move and can't be undone by MovieSort Pro."):
+            return
+        self.set_busy(True)
+        def worker():
+            done, skipped = 0, 0
+            for item in candidates:
+                if not safe_to_recycle(item.path, self.sources, Path(self.destination.get()), VIDEO_EXTENSIONS):
+                    skipped += 1
+                    continue
+                try:
+                    recycle(item.path)
+                    done += 1
+                except (OSError, RuntimeError) as exc:
+                    skipped += 1
+                    self.queue_message("work_progress", (done+skipped, len(candidates), f"Recycle failed: {exc}"))
+            self.queue_message("cleanup_complete", f"Sent {done} movie-free folder(s) to the Recycle Bin; {skipped} skipped/failed.")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def review_duplicates(self):
+        """Conservatively identified, lower-quality versions require confirmation."""
+        if self.busy or not self.duplicate_suggestions:
+            messagebox.showinfo(APP_NAME, "No confidently ranked lower-quality duplicates were found."
+                                " Install FFmpeg/ffprobe if you want codec-based comparisons.")
+            return
+        candidates = self.duplicate_suggestions
+        summary = "\n".join(f"Lower: {a.name} ({qa.width}x{qa.height})  |  Keep: {b.name} ({qb.width}x{qb.height})"
+                            for a,b,qa,qb in candidates)
+        if not messagebox.askyesno(APP_NAME,
+                f"Send {len(candidates)} lower-quality movie(s) to the Recycle Bin?"
+                "\n\nOnly confidently matched identical films/editions are compared."
+                " This does not check audio languages or subtitle preferences."
+                " Examine these pairs carefully before continuing."
+                f"\n\n{summary[:2800]}\n\nThe retained file must still exist."):
+            return
+        self.set_busy(True)
+        def worker():
+            deleted = skipped = 0
+            for low, best, lower_quality, higher_quality in candidates:
+                try:
+                    if (not low.is_file() or not best.is_file() or low.resolve()==best.resolve() or
+                            not any(low.resolve().is_relative_to(root.resolve()) for root in self.sources)):
+                        skipped += 1
+                        continue
+                    # A video may have been edited since the scan: re-probe before deletion.
+                    from library_maintenance import probe_video, clearly_lower
+                    if not clearly_lower(probe_video(low), probe_video(best)):
+                        skipped += 1
+                        continue
+                    recycle(low)
+                    deleted += 1
+                except (OSError, RuntimeError) as exc:
+                    skipped += 1
+                    self.queue_message("work_progress", (deleted+skipped, len(candidates), f"Recycle failed: {exc}"))
+            self.queue_message("duplicates_complete", f"Sent {deleted} lower-quality duplicate(s) to Recycle Bin; {skipped} skipped/failed.")
+        threading.Thread(target=worker, daemon=True).start()
+
     def correct_selected(self):
         if self.busy:
             return
@@ -1110,14 +1299,16 @@ class App(Tk):
             return
         self.set_busy(True)
         self.progress.configure(value=0)
-        args = (ready, self.mode.get(), self.rename.get(), self.include_sidecars.get())
+        args = (ready, self.mode.get(), self.rename.get(), self.include_sidecars.get(),
+                self.remove_empty_folders.get(), list(self.sources), Path(self.destination.get()).resolve())
         threading.Thread(target=self.organise_thread, args=args, daemon=True).start()
 
-    def organise_thread(self, ready, mode, rename, with_sidecars):
+    def organise_thread(self, ready, mode, rename, with_sidecars, cleanup_folders=False, source_roots=None, destination=None):
         reserved = set()
         journal = []
         success = skip = failures = unmatched_success = 0
         report = []
+        moved_origins = []
         log_path = app_dir() / "last_run.json"
         is_move = mode == "Move"
         try:
@@ -1136,6 +1327,7 @@ class App(Tk):
                     if is_move:
                         shutil.move(str(source), str(target))
                         journal.append({"from": str(source), "to": str(target)})
+                        moved_origins.append(source)
                         log_path.write_text(json.dumps({"mode": "Move", "changes": journal}, indent=2), encoding="utf-8")
                     else:
                         shutil.copy2(source, target)
@@ -1154,6 +1346,7 @@ class App(Tk):
                             if is_move:
                                 shutil.move(str(asset), str(asset_target))
                                 journal.append({"from": str(asset), "to": str(asset_target)})
+                                moved_origins.append(asset)
                                 log_path.write_text(json.dumps({"mode": "Move", "changes": journal}, indent=2), encoding="utf-8")
                             else:
                                 shutil.copy2(asset, asset_target)
@@ -1166,6 +1359,9 @@ class App(Tk):
                     failures += 1
                     report.append((str(source), str(planned), "ERROR", str(e)))
                     self.queue_message("work_progress", (i, len(ready), f"Error processing {source.name}: {e}"))
+            deleted_folders = 0
+            if is_move and cleanup_folders and moved_origins:
+                deleted_folders = cleanup_empty_source_dirs(moved_origins, source_roots or [], destination)
             with (app_dir() / "last_run_report.csv").open("w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
                 writer.writerow(("Source", "Destination", "Status", "Details"))
@@ -1173,6 +1369,8 @@ class App(Tk):
             summary = (f"Finished: {success} movie(s) {('moved' if is_move else 'copied')}"
                        f" ({unmatched_success} unmatched), {skip} already present/skipped, {failures} errors.\n\n"
                        f"Report: {app_dir() / 'last_run_report.csv'}")
+            if is_move and cleanup_folders:
+                summary += f"\n{deleted_folders} empty source subfolder(s) removed (source roots retained)."
             if is_move and success:
                 summary += "\n\nThe original files were moved, so the old source may now be empty. To sort them again, use the destination as the source."
             elif skip and not success:

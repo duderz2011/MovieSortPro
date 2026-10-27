@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
 from pathlib import Path
 
-PROVIDERS = ("Local NFO", "Local Catalogue", "TMDB", "OMDb", "Wikidata")
+PROVIDERS = ("Local NFO", "Local Catalogue", "TMDB", "OMDb", "Wikidata", "Apple Movies", "Trakt")
 FIELDS = ("title", "year", "genres", "studios", "actors", "directors", "countries", "collection", "collection_id", "collection_order", "plot", "imdb_id", "tmdb_id", "poster")
 LIST_FIELDS = {"genres", "studios", "actors", "directors", "countries"}
 
@@ -67,6 +67,32 @@ def compatible(meta: dict, title: str, year: int | None, strict=True) -> bool:
     if year and myear and abs(year - myear) > 1:
         return False
     return True
+
+
+def choose_confident_candidate(candidates, title, year=None, threshold=0.91):
+    """Return one high-confidence title match; reject ambiguous results and year conflicts."""
+    ranked = []
+    for meta in candidates:
+        if not isinstance(meta, dict) or not meta.get("title"):
+            continue
+        score = SequenceMatcher(None, normal(title), normal(meta["title"])).ratio()
+        candidate_year = parse_year(meta.get("year"))
+        if year and candidate_year and abs(year - candidate_year) > 1:
+            continue
+        if score < threshold:
+            continue
+        if year and candidate_year == year:
+            score += 0.035
+        elif year and candidate_year is None:
+            score -= 0.015
+        ranked.append((score, meta))
+    ranked.sort(key=lambda pair: pair[0], reverse=True)
+    if not ranked:
+        return {}
+    # A different film with the same name is not automatically an exact match.
+    if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 0.045:
+        return {}
+    return ranked[0][1]
 
 
 def can_merge(base: dict, extra: dict) -> bool:
@@ -194,27 +220,93 @@ class OMDbProvider:
     def __init__(self, key: str):
         self.key = key.strip()
 
-    def lookup(self, title, year=None, imdb_id=None):
-        if not self.key:
-            return {}
-        args = {"apikey": self.key, "type": "movie", "plot": "short"}
-        if imdb_id and re.fullmatch(r"tt\d{7,10}", str(imdb_id)):
-            args["i"] = imdb_id
-        else:
-            args["t"] = title
-            if year:
-                args["y"] = year
-        data = json_get("https://www.omdbapi.com/?" + urllib.parse.urlencode(args))
-        if data.get("Response") == "False":
-            return {}
-        md = canonical({
+    def request(self, args):
+        return json_get("https://www.omdbapi.com/?" + urllib.parse.urlencode({"apikey": self.key, "type": "movie", **args}))
+
+    @staticmethod
+    def parse(data):
+        return canonical({
             "title": data.get("Title"), "year": data.get("Year"),
             "genres": data.get("Genre"), "studios": data.get("Production"),
             "actors": data.get("Actors"), "directors": data.get("Director"),
             "countries": data.get("Country"), "plot": data.get("Plot"),
             "imdb_id": data.get("imdbID"), "poster": data.get("Poster"),
         })
-        return md if compatible(md, title, year) else {}
+
+    def lookup(self, title, year=None, imdb_id=None):
+        if not self.key:
+            return {}
+        if imdb_id and re.fullmatch(r"tt\d{7,10}", str(imdb_id)):
+            response = self.request({"i": imdb_id, "plot": "short"})
+            if response.get("Response") != "False":
+                md = self.parse(response)
+                if compatible(md, title, year, strict=False):
+                    return md
+        # Direct lookup is cheap and contains richer metadata.
+        queries = [{"t": title, "y": year, "plot": "short"}] if year else []
+        queries.append({"t": title, "plot": "short"})
+        for query in queries:
+            response = self.request(query)
+            if response.get("Response") != "False":
+                md = self.parse(response)
+                if compatible(md, title, year):
+                    return md
+        # 's' searches by approximate title; validate candidate IDs before trusting.
+        response = self.request({"s": title, "page": 1})
+        candidates = [self.parse(item) for item in response.get("Search", [])] if response.get("Response") != "False" else []
+        selected = choose_confident_candidate(candidates, title, year, threshold=0.88)
+        if not selected or not selected.get("imdb_id"):
+            return {}
+        details = self.request({"i": selected["imdb_id"], "plot": "short"})
+        md = self.parse(details) if details.get("Response") != "False" else {}
+        return md if compatible(md, title, year, strict=False) else {}
+
+
+class AppleMoviesProvider:
+    """No-key Apple Search API movie catalogue, good as a last-resort title/year check.
+
+    Only use documented movie fields; Apple does not reliably supply cast/studios.
+    """
+    def lookup(self, title, year=None):
+        params = {"term": title, "media": "movie", "entity": "movie", "limit": 25, "country": "gb"}
+        response = json_get("https://itunes.apple.com/search?" + urllib.parse.urlencode(params))
+        candidates = []
+        for item in response.get("results", []):
+            if item.get("kind") not in ("feature-movie", "movie") and item.get("wrapperType") != "track":
+                continue
+            movie_title = item.get("trackName") or item.get("collectionName")
+            if not movie_title:
+                continue
+            candidates.append(canonical({"title": movie_title, "year": item.get("releaseDate"),
+                                         "genres": [item.get("primaryGenreName")] if item.get("primaryGenreName") else [],
+                                         "plot": item.get("longDescription") or item.get("description")}))
+        return choose_confident_candidate(candidates, title, year, threshold=0.94)
+
+
+class TraktProvider:
+    """Optional Trakt public movie search using a user-supplied developer client ID."""
+    def __init__(self, client_id):
+        self.client_id = client_id.strip()
+
+    def lookup(self, title, year=None, imdb_id=None):
+        if not self.client_id:
+            return {}
+        params = {"query": title, "extended": "full", "limit": 25}
+        data = json_get("https://api.trakt.tv/search/movie?" + urllib.parse.urlencode(params),
+                        headers={"trakt-api-key": self.client_id, "trakt-api-version": "2"})
+        candidates = []
+        for item in data if isinstance(data, list) else []:
+            movie = item.get("movie", {})
+            ids = movie.get("ids", {})
+            if not movie.get("title"):
+                continue
+            candidates.append(canonical({"title": movie.get("title"), "year": movie.get("year"),
+                                         "genres": movie.get("genres") or [], "plot": movie.get("overview"),
+                                         "imdb_id": ids.get("imdb"), "tmdb_id": ids.get("tmdb")}))
+        selected = choose_confident_candidate(candidates, title, year, threshold=0.90)
+        if imdb_id and selected.get("imdb_id") and imdb_id != selected["imdb_id"]:
+            return {}
+        return selected
 
 
 class WikidataProvider:
@@ -288,13 +380,15 @@ class WikidataProvider:
 
 class MetadataResolver:
     """Priority based fallback, optionally filling missing fields across providers."""
-    def __init__(self, priority, enabled, tmdb_token="", omdb_key="", catalogue_path="", merge=False, tmdb_factory=None):
+    def __init__(self, priority, enabled, tmdb_token="", omdb_key="", catalogue_path="", merge=False, tmdb_factory=None, trakt_key=""):
         self.priority = [name for name in priority if name in PROVIDERS and enabled.get(name, False)]
         self.merge = bool(merge)
         self.errors = []
         self.tmdb = tmdb_factory(tmdb_token) if tmdb_token and tmdb_factory and "TMDB" in self.priority else None
         self.omdb = OMDbProvider(omdb_key) if omdb_key and "OMDb" in self.priority else None
         self.wikidata = WikidataProvider() if "Wikidata" in self.priority else None
+        self.apple = AppleMoviesProvider() if "Apple Movies" in self.priority else None
+        self.trakt = TraktProvider(trakt_key) if trakt_key and "Trakt" in self.priority else None
         self.catalogue = LocalCatalogue(catalogue_path) if catalogue_path and "Local Catalogue" in self.priority else None
 
     def lookup(self, video, title, year):
@@ -307,6 +401,8 @@ class MetadataResolver:
             if provider == "OMDb" and not self.omdb:
                 continue
             if provider == "Local Catalogue" and not self.catalogue:
+                continue
+            if provider == "Trakt" and not self.trakt:
                 continue
             try:
                 if provider == "Local NFO":
@@ -322,6 +418,10 @@ class MetadataResolver:
                     value = self.omdb.lookup(title, year, current.get("imdb_id"))
                 elif provider == "Wikidata":
                     value = self.wikidata.lookup(title, year, current.get("imdb_id"))
+                elif provider == "Apple Movies":
+                    value = self.apple.lookup(title, year)
+                elif provider == "Trakt":
+                    value = self.trakt.lookup(title, year, current.get("imdb_id"))
                 else:
                     value = self.catalogue.lookup(video, title, year)
                 if not value:

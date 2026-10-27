@@ -23,7 +23,7 @@ jobs:
       - name: Run unit tests
         run: python -m unittest discover -v
       - name: Install PyInstaller
-        run: python -m pip install 'pyinstaller>=6,<7'
+        run: python -m pip install 'pyinstaller>=6,<7' send2trash
       - name: Build standalone Windows executable
         run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name MovieSortPro MovieSortPro.py
       - name: Package release ZIP
