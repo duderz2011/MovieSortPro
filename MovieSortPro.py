@@ -277,6 +277,21 @@ def main_target(movie: Movie, destination: Path, preset: str, movie_folder: bool
     return parent / (stem + movie.path.suffix)
 
 
+def confidently_identified(movie: Movie) -> bool:
+    """Only a confirmed metadata-provider match can enter ordinary sorting.
+
+    A filename-derived title/year is a guess, not a successful match. Likewise,
+    a metadata outage is not evidence that the filename names the right movie.
+    """
+    state = movie.match_state.strip()
+    return bool(movie.metadata.get("title")) and (state == "Matched" or state.startswith("Matched:"))
+
+
+def unmatched_target(movie: Movie, destination: Path) -> Path:
+    """Preserve filenames for later manual correction and safe rescanning."""
+    return destination / "unmatched" / movie.path.name
+
+
 def sidecars(movie_file: Path) -> list[Path]:
     try:
         files = [p for p in movie_file.parent.iterdir() if p.is_file()]
@@ -323,7 +338,7 @@ def choose_target(source: Path, desired: Path, reserved: set[str]) -> tuple[Opti
 class App(Tk):
     def __init__(self):
         super().__init__()
-        self.title(APP_NAME + " V3 — Movie Library & Collections")
+        self.title(APP_NAME + " V3.1 — Movie Library & Collections")
         self.geometry("1220x790")
         self.minsize(950, 650)
         self.configure(bg="#151a24")
@@ -361,6 +376,7 @@ class App(Tk):
         self.rename = BooleanVar(value=True)
         self.movie_folder = BooleanVar(value=False)
         self.include_sidecars = BooleanVar(value=True)
+        self.route_unmatched = BooleanVar(value=True)
         self.auto_collections = BooleanVar(value=True)
         self.collection_minimum = StringVar(value="2")
         self.check_missing = BooleanVar(value=True)
@@ -385,7 +401,8 @@ class App(Tk):
         if saved.get("mode") in ("Copy", "Move"):
             self.mode.set(saved["mode"])
         for name, var in (("rename", self.rename), ("movie_folder", self.movie_folder),
-                          ("include_sidecars", self.include_sidecars), ("merge_metadata", self.merge_metadata),
+                          ("include_sidecars", self.include_sidecars), ("route_unmatched", self.route_unmatched),
+                          ("merge_metadata", self.merge_metadata),
                           ("auto_collections", self.auto_collections), ("check_missing", self.check_missing)):
             if isinstance(saved.get(name), bool):
                 var.set(saved[name])
@@ -415,6 +432,7 @@ class App(Tk):
             "selected_actor": self.selected_actor.get(), "mode": self.mode.get(),
             "rename": self.rename.get(), "movie_folder": self.movie_folder.get(),
             "include_sidecars": self.include_sidecars.get(),
+            "route_unmatched": self.route_unmatched.get(),
             "auto_collections": self.auto_collections.get(),
             "collection_minimum": self.collection_minimum.get(),
             "check_missing": self.check_missing.get(),
@@ -440,7 +458,7 @@ class App(Tk):
         """Display metadata provider credits without exposing user API credentials."""
         messagebox.showinfo(
             "About MovieSort Pro / Credits",
-            "MovieSort Pro V3\nFree and open-source movie organiser (MIT).\n\n"
+            "MovieSort Pro V3.1\nFree and open-source movie organiser (MIT).\n\n"
             "This product uses the TMDB API but is not endorsed or certified by TMDB.\n"
             "TMDB: https://www.themoviedb.org\n\n"
             "Other optional sources: OMDb (https://www.omdbapi.com), "
@@ -528,6 +546,8 @@ class App(Tk):
         row2.pack(fill="x", pady=(8, 0))
         ttk.Checkbutton(row2, text="Extra movie folder (ignored if Movie Title is a level)", variable=self.movie_folder, command=self.refresh_preview).pack(side="left")
         ttk.Checkbutton(row2, text="Bring matching subtitles and artwork", variable=self.include_sidecars).pack(side="left", padx=(19, 0))
+        ttk.Checkbutton(row2, text="Send unidentified films to unmatched", variable=self.route_unmatched,
+                        command=self.refresh_preview).pack(side="left", padx=(19, 0))
         collection_row = ttk.Frame(settings)
         collection_row.pack(fill="x", pady=(8, 0))
         ttk.Checkbutton(collection_row, text="Automatically organise movie collections", variable=self.auto_collections,
@@ -818,14 +838,14 @@ class App(Tk):
             elif kind == "scan_done":
                 self.set_busy(False)
                 self.refresh_preview()
-                review_count = sum(not m.match_state.startswith("Matched:") for m in self.movies)
+                review_count = sum(not confidently_identified(m) for m in self.movies)
                 if not self.movies:
                     self.status.set("No movies found. If you used MOVE before, the originals are now in the destination. Add that destination as a source to re-sort them.")
                     messagebox.showinfo(APP_NAME, "No movie files found in the selected source folders.\n\nIf the first run used MOVE, the files are now in the destination folder. Choose that folder as a source and scan again.\n\nFor testing without removing source files, use COPY.")
                 else:
                     found_missing = sum(len(c.missing) for c in self.collection_groups)
                     self.status.set(f"Scan finished: {len(self.movies)} videos • {len(self.collection_groups)} collections"
-                                    f" • {found_missing} released titles absent from scanned folders • {review_count} need review.")
+                                    f" • {found_missing} released titles absent from scanned folders • {review_count} unmatched / need review.")
             elif kind == "work_progress":
                 i, total, outcome = data
                 self.progress.configure(value=int(i * 100 / max(total, 1)))
@@ -848,6 +868,12 @@ class App(Tk):
     def plan_for(self, movie: Movie) -> tuple[Optional[Path], str]:
         if not self.destination.get().strip():
             return None, "Choose destination"
+        # Never make up a genre/studio/actor from an unverified filename.
+        # Match failures (including provider outages) are quarantined for review.
+        # Copy/Move still follows the single global Action setting.
+        destination = Path(self.destination.get())
+        if self.route_unmatched.get() and not confidently_identified(movie):
+            return unmatched_target(movie, destination), "Unmatched - needs review"
         preset = self.preset.get()
         levels = [x.get() for x in self.levels] if preset == "Custom levels" else []
         if not any(level != "None" for level in levels) and preset == "Custom levels":
@@ -897,7 +923,8 @@ class App(Tk):
         md = movie.metadata
         title = md.get("title") or movie.title
         year = md.get("year") or movie.year
-        values = (movie.path.name, f"{title} ({year})" if year else title, movie.match_state, str(target) if target else note)
+        state = movie.match_state + (" → unmatched" if note.startswith("Unmatched") else "")
+        values = (movie.path.name, f"{title} ({year})" if year else title, state, str(target) if target else note)
         self.tree.insert("", "end", iid=str(index), values=values)
 
     def refresh_preview(self):
@@ -906,7 +933,8 @@ class App(Tk):
             movie.target, movie.notes = target, note
             md = movie.metadata
             title, year = md.get("title") or movie.title, md.get("year") or movie.year
-            values = (movie.path.name, f"{title} ({year})" if year else title, movie.match_state, str(target) if target else note)
+            state = movie.match_state + (" → unmatched" if note.startswith("Unmatched") else "")
+            values = (movie.path.name, f"{title} ({year})" if year else title, state, str(target) if target else note)
             if self.tree.exists(str(index)):
                 self.tree.item(str(index), values=values)
         if not self.busy:
@@ -932,7 +960,7 @@ class App(Tk):
             messagebox.showinfo(APP_NAME, "No collections with enough distinct owned titles were found in this scan.")
             return
         window = Toplevel(self)
-        window.title("MovieSort Pro V3 — Collections & Missing Movies")
+        window.title("MovieSort Pro V3.1 — Collections & Missing Movies")
         window.geometry("1040x680")
         window.minsize(780, 480)
         window.configure(bg="#151a24")
@@ -1064,7 +1092,8 @@ class App(Tk):
         if self.busy:
             return
         self.refresh_preview()
-        ready = [(m.path, m.target) for m in self.movies if m.target and m.path.exists()]
+        ready = [(m.path, m.target, m.notes.startswith("Unmatched"))
+                 for m in self.movies if m.target and m.path.exists()]
         skipped = len(self.movies) - len(ready)
         if not ready:
             reason = ("Files may already have been MOVED. Scan the destination as your new source to re-sort the library."
@@ -1073,7 +1102,11 @@ class App(Tk):
             messagebox.showwarning(APP_NAME, reason)
             return
         self.save_preferences()
-        if not messagebox.askyesno(APP_NAME, f"{self.mode.get()} {len(ready)} movie(s) to their previewed destinations?\n\n{skipped} file(s) will be untouched. Existing files won't be overwritten.\n\nConfirm to proceed."):
+        unmatched = sum(is_unmatched for _, _, is_unmatched in ready)
+        if not messagebox.askyesno(APP_NAME, f"{self.mode.get()} {len(ready)} movie(s) to their previewed destinations?"
+                                     f"\n\n{unmatched} unidentified movie(s) will go to the unmatched folder."
+                                     f"\n{skipped} file(s) will be untouched. Existing files won't be overwritten."
+                                     "\n\nConfirm to proceed."):
             return
         self.set_busy(True)
         self.progress.configure(value=0)
@@ -1083,12 +1116,12 @@ class App(Tk):
     def organise_thread(self, ready, mode, rename, with_sidecars):
         reserved = set()
         journal = []
-        success = skip = failures = 0
+        success = skip = failures = unmatched_success = 0
         report = []
         log_path = app_dir() / "last_run.json"
         is_move = mode == "Move"
         try:
-            for i, (source, planned) in enumerate(ready, 1):
+            for i, (source, planned, is_unmatched) in enumerate(ready, 1):
                 try:
                     if not source.exists():
                         raise FileNotFoundError(f"Source has disappeared: {source}")
@@ -1107,10 +1140,13 @@ class App(Tk):
                     else:
                         shutil.copy2(source, target)
                     success += 1
-                    report.append((str(source), str(target), "OK", note))
+                    if is_unmatched:
+                        unmatched_success += 1
+                    report.append((str(source), str(target), "UNMATCHED" if is_unmatched else "OK",
+                                   ("Unidentified; saved for review" if is_unmatched else note)))
                     for asset in extra:
                         try:
-                            desired_asset = companion_target(asset, source, target, rename)
+                            desired_asset = companion_target(asset, source, target, rename and not is_unmatched)
                             asset_target, _ = choose_target(asset, desired_asset, reserved)
                             if asset_target is None:
                                 continue
@@ -1134,8 +1170,8 @@ class App(Tk):
                 writer = csv.writer(f)
                 writer.writerow(("Source", "Destination", "Status", "Details"))
                 writer.writerows(report)
-            summary = (f"Finished: {success} movie(s) {('moved' if is_move else 'copied')}, "
-                       f"{skip} already present/skipped, {failures} errors.\n\n"
+            summary = (f"Finished: {success} movie(s) {('moved' if is_move else 'copied')}"
+                       f" ({unmatched_success} unmatched), {skip} already present/skipped, {failures} errors.\n\n"
                        f"Report: {app_dir() / 'last_run_report.csv'}")
             if is_move and success:
                 summary += "\n\nThe original files were moved, so the old source may now be empty. To sort them again, use the destination as the source."

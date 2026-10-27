@@ -2,7 +2,7 @@
 
 **MovieSort Pro** is a free, open-source Windows movie library organiser. Point it at one or more folders containing movies, fetch available film metadata, choose how you want files grouped, review the proposed changes, and copy or move the files into a new folder structure.
 
-> **Status:** v3 community preview. The automated unit tests pass, but Windows packaging, network metadata services and large-library edge cases still need community testing. Start with **Copy** and a small sample library; keep backups.
+> **Status:** v3.1 community preview. The automated unit tests pass, but Windows packaging, network metadata services and large-library edge cases still need community testing. Start with **Copy** and a small sample library; keep backups.
 
 ## Features
 
@@ -10,6 +10,7 @@
 - Identify films using local filename clues and your selected metadata sources.
 - Organise using up to **three folder levels** with choices including genre, studio, year, decade, lead or selected actor, director, country, film collection, title, A–P / Q–Z, and A–Z.
 - Preview destination paths before changing anything.
+- **Unmatched movies:** when a confident film match is unavailable (including ambiguous titles or metadata lookup failures), route the video to `unmatched/` under the output directory instead of guessing a genre or studio. Enabled by default, and can be disabled in the sorting settings. Original filenames are preserved so you can identify and retry them later.
 - **Copy** (default) or **Move**, optionally renaming movie files and including matching subtitles, NFOs and artwork.
 - Skip exact destination duplicates using SHA-256 checks. Different files are given distinct names, not overwritten.
 - Reorganise an already-sorted folder, including using the same source and destination.
@@ -47,13 +48,14 @@ Install Python 3.10+, then run `Build-Windows-EXE.bat`. This installs PyInstalle
 4. Keep the operation on **Copy** when testing.
 5. Leave **Automatically organise movie collections** enabled (default minimum: 2 films) to route qualifying sets to `Collections/Series Name/`. Click **Collections / Missing Movies** after scanning to review present, missing and upcoming titles. Collection groups can be detected offline using NFO/catalogue data; **missing-title verification requires an enabled TMDB source and a valid TMDB token**.
 6. Click **Scan & Identify**, review all proposed destinations, and then **Organise Movies**.
-7. Open **Last Report** for successes, skips or errors.
+7. Open **Last Report** for successes, skips or errors. Successful transfers to `unmatched` have their own `UNMATCHED` status and are counted in the summary.
 
 **Sample paths:**
 
 ```text
 D:\Movies\Action\2024\Example Movie (2024)\Example Movie (2024).mkv
 D:\Movies\Collections\The Mighty Ducks Collection\D3_ The Mighty Ducks (1996).mkv
+D:\Movies\unmatched\Unknown.Movie.2022.mkv
 D:\Movies\Universal Pictures\A-P\Another Film (2021).mp4
 ```
 
@@ -69,7 +71,7 @@ D:\Movies\Universal Pictures\A-P\Another Film (2021).mp4
 | [OMDb](https://www.omdbapi.com/) | Yes | Additional title and movie metadata via OMDb API. |
 | [Wikidata](https://www.wikidata.org/) | No | Public metadata, which can be incomplete or slower. |
 
-Pick provider priority to control which metadata wins. You can optionally merge missing fields from a later source when the movie match is compatible. Missing or ambiguous matches are marked for review instead of being silently assigned an arbitrary film.
+Pick provider priority to control which metadata wins. You can optionally merge missing fields from a later source when the movie match is compatible. Missing or ambiguous matches are marked for review and (by default) go to the `unmatched` folder, rather than being silently assigned an arbitrary film.
 
 **TMDB notice:** This product uses the TMDB API but is not endorsed or certified by TMDB. The app includes this notice in **About / Credits**. TMDB also requires its **approved logo** in apps that use the API; an approved logo is **not bundled yet**, so add one before publicly distributing a TMDB-enabled binary. See [TMDB attribution guidance](https://developer.themoviedb.org/docs/faq) and [approved logos](https://www.themoviedb.org/about/logos-attribution). Users are responsible for complying with each metadata provider's terms, limits and attribution requirements. The project does not bundle an API key.
 
@@ -88,6 +90,18 @@ The app stores local configuration and reports beneath:
 Movie titles and their parsed names may be sent to your enabled **online** metadata providers. The app does not upload video files to them. Local NFO / catalogue access does not require the internet.
 
 Windows stores API credentials encrypted with the signed-in user's DPAPI. On platforms without DPAPI, credentials are not persisted. **Never commit** your own `preferences.json`, API tokens, local paths, personal NFOs, or scan logs.
+
+## Unmatched files (V3.1)
+
+Once a scan is complete, MovieSort Pro checks each video for a confident metadata match. Films without one receive a proposed destination at `<output>/unmatched/<original filename>`, regardless of the normal genre/year rules. This includes offline filenames without an NFO/catalogue match, ambiguous matches and temporary metadata provider errors.
+
+- **Check the preview first.** You can correct a match before organising, or leave it in `unmatched` to investigate later.
+- The global **Copy** (default) or **Move** action applies to both matched and unmatched films. Move removes the source only after a successful transfer; Copy leaves originals intact. Nothing is forcibly moved while Copy is selected.
+- Matching subtitles, NFO files and artwork follow the movie when **Bring matching subtitles and artwork** is enabled. Unmatched filenames are never automatically renamed.
+- Repeated runs skip files already at their intended destination or with identical content. Collisions never overwrite files.
+- For a future reattempt, select the existing `unmatched` directory or destination library as a source, then **Scan & Identify** again. Films with newly recognised metadata can be moved into their regular destination folders.
+- Disabling **Send unidentified films to unmatched** restores the prior sorting-plan behaviour for unresolved files.
+- Use the run report to distinguish `UNMATCHED` transfers from `OK`, `SKIPPED` and `ERROR`.
 
 ## Limitations and safety
 
